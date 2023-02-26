@@ -86,6 +86,7 @@ func http2(target string, rps int) {
             return nil
         },
     }
+    client.Transport, _ = New(client.Transport)
     req, err := http.NewRequest("GET", target, nil)
     if err != nil {
       goto restart
